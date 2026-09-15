@@ -1013,6 +1013,46 @@ fn terminal_deep_subtree_cfg(n: usize, nnz: usize, best_flops: u64, amd_flops: u
     cfg
 }
 
+/// TEST-ONLY scale (percent, clamped to 0..=400) applied to the *budget* of
+/// every round of the `4.subtree` chain in `leader_order`, so one build can
+/// price that chain's budget as a curve (wall AND value per row) instead of
+/// only on/off. Production compiles `base` unchanged — the shipped budgets are
+/// the callers' own literals. `chain_on = false` suppresses the whole chain's
+/// budget (the basin-diversification fork's second lineage).
+/// Configured through `SSI_SUBTREE_BUDGET_PCT`.
+#[inline]
+fn subtree_budget(base: i64, chain_on: bool) -> i64 {
+    if !chain_on {
+        return 0;
+    }
+    #[cfg(test)]
+    {
+        let pct = std::env::var("SSI_SUBTREE_BUDGET_PCT")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(100)
+            .clamp(0, 400);
+        base.saturating_mul(pct) / 100
+    }
+    #[cfg(not(test))]
+    {
+        base
+    }
+}
+
+/// Which lineage the current `leader_order` call runs: `true` is the shipped
+/// pipeline, `false` is the same pipeline with the `4.subtree` chain's budget
+/// suppressed. A thread-local keeps the `order()` fork from re-parameterising
+/// every intermediate call site, and the two lineages never share it.
+std::thread_local! {
+    static CHAIN_LINEAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[inline]
+fn chain_lineage_on() -> bool {
+    CHAIN_LINEAGE.with(|c| c.get())
+}
+
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
 /// a fixed seed, so every run produces the identical sequence — the determinism
 /// gate requires the two `order()` runs to agree byte-for-byte.
@@ -1343,6 +1383,27 @@ fn mid_engine_cfg() -> (i64, u8, u8) {
     (0, 0, 0)
 }
 
+/// Shape gate for the basin-diversification fork below.
+///
+/// Gating at `n <= 600` and `nnz <= 5_000` bounds the critical path at 0.72s
+/// while keeping the rows whose permutation the fork strictly improves
+/// (`waterund14`, `gancns`, `chimera_mgw-c8-439-onc8-001`).
+/// Every row outside the band takes the byte-identical pre-fork code path.
+const BASIN_FORK_MAX_N: usize = 600;
+const BASIN_FORK_MAX_NNZ: usize = 5_000;
+
+/// TEST-ONLY kill switch for the basin fork, so a probe can A/B the shipped
+/// program against its own pre-fork baseline in one build.
+fn basin_fork_gate(n: usize, nnz: usize) -> bool {
+    #[cfg(test)]
+    {
+        if std::env::var_os("SSI_NO_BASIN_FORK").is_some() {
+            return false;
+        }
+    }
+    n <= BASIN_FORK_MAX_N && nnz <= BASIN_FORK_MAX_NNZ
+}
+
 /// Return an elimination order for `pattern` (best-of over the ordering family).
 pub fn order(pattern: &Pattern) -> Vec<usize> {
     if let Some(perm) = forest_certificate(pattern) { return perm; }
@@ -1351,6 +1412,41 @@ pub fn order(pattern: &Pattern) -> Vec<usize> {
     ) {
         return perm;
     }
+    if basin_fork_gate(pattern.n, pattern.nnz()) {
+        // Both lineages are read-only over `pattern`; each sets its own
+        // thread-local lineage flag before entering `leader_order`.
+        let run = |chain_on: bool| {
+            CHAIN_LINEAGE.with(|c| c.set(chain_on));
+            leader_order(pattern)
+        };
+        let (a, b) = std::thread::scope(|s| {
+            let ha = s.spawn(|| run(true));
+            let hb = s.spawn(|| run(false));
+            (ha.join().ok(), hb.join().ok())
+        });
+        if let (Some(a), Some(b)) = (a, b) {
+            if is_bijection(&a, pattern.n) && is_bijection(&b, pattern.n) {
+                let sp = ScoringPattern {
+                    n: pattern.n,
+                    col_ptr: pattern.col_ptr.clone(),
+                    row_idx: pattern.row_idx.clone(),
+                };
+                let fa = flops_of(&sp, &a);
+                let fb = flops_of(&sp, &b);
+                if fb < fa {
+                    return b;
+                }
+                return a;
+            }
+            if is_bijection(&a, pattern.n) {
+                return a;
+            }
+            if is_bijection(&b, pattern.n) {
+                return b;
+            }
+        }
+    }
+    CHAIN_LINEAGE.with(|c| c.set(true));
     leader_order(pattern)
 }
 
@@ -3391,6 +3487,7 @@ fn leader_order(pattern: &Pattern) -> Vec<usize> {
     if (SUBTREE_MIN_N..=SUBTREE_CHAIN_MAX_N).contains(&n) && nnz <= 1_500_000 {
         let (mut candidate, counts, parent) = symbolic_flat::prep_subtree(&scoring_pat, &best_perm);
         let mut cfg1 = subtree_cfg_for(n, nnz);
+        cfg1.budget = subtree_budget(cfg1.budget, chain_lineage_on());
         let mut improved = rgreedy::subtree_refine(
             n,
             &pattern.col_ptr,
@@ -3414,7 +3511,7 @@ fn leader_order(pattern: &Pattern) -> Vec<usize> {
             cfg1.round = 1;
             if n < 1_000 {
                 cfg1.streams = 2;
-                cfg1.budget = 1_000_000; if n >= 1_000 { cfg1.budget /= 2; }
+                cfg1.budget = subtree_budget(1_000_000, chain_lineage_on()); if n >= 1_000 { cfg1.budget /= 2; }
             } else if n < 10_000 {
                 cfg1.max_s = 256;
             } else {
@@ -3444,7 +3541,7 @@ fn leader_order(pattern: &Pattern) -> Vec<usize> {
                 cfg2.round = 1;
                 cfg2.max_blocks = 32;
                 cfg2.min_s = 16;
-                cfg2.budget = 8_000_000; if n >= 1_000 { cfg2.budget /= 2; }
+                cfg2.budget = subtree_budget(8_000_000, chain_lineage_on()); if n >= 1_000 { cfg2.budget /= 2; }
                 // Wider round-2 window only on below-anchor medium graphs.
                 // Raising lt_1k / gt_10k max_s here regresses those buckets
                 // (0055; this session's full-width trial scored 0.843829).
@@ -3483,7 +3580,7 @@ fn leader_order(pattern: &Pattern) -> Vec<usize> {
                         cfg3.max_blocks = 32;
                         cfg3.min_s = 16;
                         cfg3.max_s = 512;
-                        cfg3.budget = 8_000_000; if n >= 1_000 { cfg3.budget /= 2; }
+                        cfg3.budget = subtree_budget(8_000_000, chain_lineage_on()); if n >= 1_000 { cfg3.budget /= 2; }
                         let improved3 = rgreedy::subtree_refine(
                             n,
                             &pattern.col_ptr,
@@ -3518,6 +3615,7 @@ fn leader_order(pattern: &Pattern) -> Vec<usize> {
                                 } else {
                                     32_000_000
                                 }; if n >= 1_000 { cfg4.budget /= 2; }
+                                cfg4.budget = subtree_budget(cfg4.budget, chain_lineage_on());
                                 let improved4 = rgreedy::subtree_refine(
                                      n,
                                      &pattern.col_ptr,
@@ -3542,10 +3640,10 @@ fn leader_order(pattern: &Pattern) -> Vec<usize> {
                                         if n < 100_000 || best_flops != amd_flops {
                                             if (1_000..4_000).contains(&n) {
                                                 cfg5.max_blocks = 16;
-                                                cfg5.budget = 32_000_000; if n >= 1_000 { cfg5.budget /= 2; }
+                                                cfg5.budget = subtree_budget(32_000_000, chain_lineage_on()); if n >= 1_000 { cfg5.budget /= 2; }
                                             } else {
                                                 cfg5.max_blocks = 32;
-                                                cfg5.budget = 16_000_000; if n >= 1_000 { cfg5.budget /= 2; }
+                                                cfg5.budget = subtree_budget(16_000_000, chain_lineage_on()); if n >= 1_000 { cfg5.budget /= 2; }
                                             }
                                             let improved5 = rgreedy::subtree_refine(
                                                 n,
