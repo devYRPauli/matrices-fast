@@ -17,6 +17,25 @@ pub(super) fn capture(pool: &[(u64, Vec<usize>)]) {
 }
 
 
+#[cfg(test)]
+pub(super) fn donor_capture_active() -> bool {
+    DONORS.with(|donors| donors.borrow().is_some())
+}
+
+#[cfg(test)]
+#[test]
+fn basin_fork_keeps_transplant_donor_capture() {
+    let pattern = probe::basin_probe_pattern();
+    let sentinel = vec![vec![pattern.n]];
+    DONORS.with(|donors| *donors.borrow_mut() = Some(sentinel.clone()));
+    let perm = order(&pattern);
+    let donors = DONORS
+        .with(|donors| donors.borrow_mut().take())
+        .expect("the caller must retain the donor capture");
+    assert_ne!(donors, sentinel, "the caller must receive transplant donors");
+    assert!(is_bijection(&perm, pattern.n));
+}
+
 /// Production terminal cross-candidate subtree transplant with verification
 /// reservation (0090 screen). Strict-accept only; ledger-bounded; structural
 /// gates only. Donors are displaced portfolio orderings already retained.

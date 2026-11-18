@@ -25,6 +25,30 @@ pub(super) mod leader_tail;
 mod sorted_validation;
 pub(super) mod terminal_followup;
 
+/// These probes store both their settings and their results on the caller.
+pub(super) fn requires_caller_thread() -> bool {
+    alt_lineage::is_active()
+        || minfill_cost::is_enabled()
+        || CORE_CAPTURE_ENABLED.with(|enabled| enabled.get())
+        || transplant_probe::donor_capture_active()
+}
+
+// A non-chordal core with leaves, small enough for the basin fork. Peeling
+// leaves retains the degree-four core so residual-core probes have work to record.
+pub(super) fn basin_probe_pattern() -> Pattern {
+    let side = 4;
+    let core_size = side * side;
+    let n = 56;
+    let mut edges = Vec::new();
+    for vertex in 0..core_size {
+        let (row, col) = (vertex / side, vertex % side);
+        edges.push((vertex, row * side + (col + 1) % side));
+        edges.push((vertex, ((row + 1) % side) * side + col));
+    }
+    edges.extend((core_size..n).map(|leaf| (leaf, leaf % core_size)));
+    Pattern::from_edges(n, &edges)
+}
+
 /// Buckets exactly as the harness does (lt_1k / 1k_10k / gt_10k).
 fn bucket(n: usize) -> usize {
     if n < 1_000 {
@@ -2559,6 +2583,16 @@ pub(super) fn capture_core_candidate(
             core_perm: core_perm.to_vec(),
         })
     });
+}
+
+#[test]
+fn basin_fork_keeps_core_candidate_capture() {
+    let pattern = basin_probe_pattern();
+    CORE_CAPTURE_ENABLED.with(|enabled| enabled.set(true));
+    let perm = order(&pattern);
+    CORE_CAPTURE_ENABLED.with(|enabled| enabled.set(false));
+    assert!(!take_core_candidates().is_empty());
+    assert!(is_bijection(&perm, pattern.n));
 }
 
 fn take_core_candidates() -> Vec<CoreCandidate> {

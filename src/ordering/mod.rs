@@ -1393,11 +1393,12 @@ const BASIN_FORK_MAX_N: usize = 600;
 const BASIN_FORK_MAX_NNZ: usize = 5_000;
 
 /// TEST-ONLY kill switch for the basin fork, so a probe can A/B the shipped
-/// program against its own pre-fork baseline in one build.
+/// program against its own pre-fork baseline in one build. Active capture
+/// probes also need the default lineage on their calling thread.
 fn basin_fork_gate(n: usize, nnz: usize) -> bool {
     #[cfg(test)]
     {
-        if std::env::var_os("SSI_NO_BASIN_FORK").is_some() {
+        if probe::requires_caller_thread() || std::env::var_os("SSI_NO_BASIN_FORK").is_some() {
             return false;
         }
     }
