@@ -15,13 +15,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 fn harness_bin() -> PathBuf {
-    // The integration test binary runs from target/<profile>/deps; the harness
-    // binary is two levels up at target/<profile>/matrices-fast.
-    let mut p = std::env::current_exe().unwrap();
-    p.pop(); // deps
-    p.pop(); // profile dir
-    p.push("matrices-fast");
-    p
+    // Cargo supplies the final executable path independently of its build cache.
+    PathBuf::from(env!("CARGO_BIN_EXE_matrices-fast"))
 }
 
 fn candidate_bin() -> PathBuf {

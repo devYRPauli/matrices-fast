@@ -49,6 +49,10 @@ thread_local! {
     static CALLS: RefCell<Vec<Call>> = const { RefCell::new(Vec::new()) };
 }
 
+pub(super) fn is_enabled() -> bool {
+    ENABLED.with(|enabled| enabled.get())
+}
+
 /// Called from the pass's own call site in `order_core`, immediately after the
 /// production call, with that call's inputs and outputs. Re-runs both
 /// implementations on the identical `(core, budget)` pair to time them and to
@@ -62,7 +66,7 @@ pub(crate) fn observe(
     perm: &[usize],
     charged: i64,
 ) {
-    if !ENABLED.with(|e| e.get()) {
+    if !is_enabled() {
         return;
     }
     let t = Instant::now();
@@ -93,6 +97,17 @@ pub(crate) fn observe(
             truncated: charged >= budget_before,
         })
     });
+}
+
+#[test]
+fn basin_fork_keeps_minfill_cost_capture() {
+    let pattern = super::basin_probe_pattern();
+    ENABLED.with(|enabled| enabled.set(true));
+    let perm = order(&pattern);
+    ENABLED.with(|enabled| enabled.set(false));
+    let calls = CALLS.with(|calls| std::mem::take(&mut *calls.borrow_mut()));
+    assert!(!calls.is_empty(), "the caller must receive core min-fill costs");
+    assert!(super::is_bijection(&perm, pattern.n));
 }
 
 /// Per-row cost of the shipped residual-core minimum-fill pass, and the

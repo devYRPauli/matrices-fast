@@ -47,9 +47,13 @@ fn retain(pool: &mut Vec<(u64, Vec<usize>)>, keep: usize, f: u64, perm: &[usize]
     pool.truncate(keep);
 }
 
+pub(super) fn is_active() -> bool {
+    ACTIVE.with(|active| active.get())
+}
+
 /// Every full-pattern score the pipeline pays, whatever stage produced it.
 pub(in crate::ordering) fn note_scored(f: u64, perm: &[usize]) {
-    if !ACTIVE.with(|a| a.get()) {
+    if !is_active() {
         return;
     }
     UNIVERSE.with(|u| retain(&mut u.borrow_mut(), UNIVERSE_KEEP, f, perm));
@@ -77,6 +81,19 @@ pub(in crate::ordering) fn audit_end() {
     ACTIVE.with(|a| a.set(false));
 }
 
+#[test]
+fn basin_fork_keeps_alt_lineage_capture() {
+    let pattern = super::basin_probe_pattern();
+    audit_begin();
+    let perm = super::order(&pattern);
+    audit_end();
+    let capture = CAPTURED.with(|captured| captured.borrow_mut().take());
+    let capture = capture.expect("the caller must receive the lineage capture");
+    assert_eq!(capture.n, pattern.n);
+    assert!(!capture.universe.is_empty());
+    assert!(super::is_bijection(&perm, pattern.n));
+}
+
 /// The `consider` funnel's displaced ordering, under production's own rule.
 pub(in crate::ordering) fn note_consider(
     f: u64,
@@ -84,7 +101,7 @@ pub(in crate::ordering) fn note_consider(
     best_flops: u64,
     best_perm: &[usize],
 ) {
-    if !ACTIVE.with(|a| a.get()) {
+    if !is_active() {
         return;
     }
     let (score, ordering) = if f < best_flops { (best_flops, best_perm) } else { (f, perm) };
@@ -99,7 +116,7 @@ pub(in crate::ordering) fn capture_entry(
     incumbent: &[usize],
     shipped: &[(u64, Vec<usize>)],
 ) {
-    if !ACTIVE.with(|a| a.get()) {
+    if !is_active() {
         return;
     }
     let captured = Captured {
